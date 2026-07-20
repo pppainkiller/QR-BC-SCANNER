@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>POS Scanner</title>
-  <!-- Using html5-qrcode for robust QR/Barcode support as we already configured -->
+  <!-- Using html5-qrcode for robust QR/Barcode support -->
   <script src="https://unpkg.com/html5-qrcode"></script>
   <style>
     body { margin: 0; background: #000; color: white; font-family: 'Segoe UI', Arial, sans-serif; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
@@ -24,12 +24,17 @@
 
   <script>
     const html5QrCode = new Html5Qrcode("reader");
+    
+    // THIS CONFIGURATION MAKES IT READ BOTH QR AND BARCODES
     const config = { 
       fps: 10, 
       qrbox: function(vw, vh) { return { width: Math.min(vw * 0.8, 300), height: 150 }; },
       formatsToSupport: [ 
-        Html5QrcodeSupportedFormats.QR_CODE, Html5QrcodeSupportedFormats.CODE_128, 
-        Html5QrcodeSupportedFormats.CODE_39, Html5QrcodeSupportedFormats.EAN_13, Html5QrcodeSupportedFormats.UPC_A
+        Html5QrcodeSupportedFormats.QR_CODE, 
+        Html5QrcodeSupportedFormats.CODE_128, 
+        Html5QrcodeSupportedFormats.CODE_39, 
+        Html5QrcodeSupportedFormats.EAN_13, 
+        Html5QrcodeSupportedFormats.UPC_A
       ]
     };
 
@@ -45,7 +50,7 @@
           }
         });
       },
-      (errorMessage) => { /* Ignore constant read errors */ }
+      (errorMessage) => { /* Ignore constant read errors as it searches */ }
     ).catch(err => {
       // Fallback to front camera if back fails
       html5QrCode.start({ facingMode: "user" }, config, (text) => {
