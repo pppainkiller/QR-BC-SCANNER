@@ -4,7 +4,6 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>POS Scanner</title>
-  <!-- Using html5-qrcode for robust QR/Barcode support -->
   <script src="https://unpkg.com/html5-qrcode"></script>
   <style>
     body { margin: 0; background: #000; color: white; font-family: 'Segoe UI', Arial, sans-serif; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
@@ -25,10 +24,11 @@
   <script>
     const html5QrCode = new Html5Qrcode("reader");
     
-    // THIS CONFIGURATION MAKES IT READ BOTH QR AND BARCODES
+    // SPEED OPTIMIZATION CONFIGURATION
     const config = { 
-      fps: 10, 
-      qrbox: function(vw, vh) { return { width: Math.min(vw * 0.8, 300), height: 150 }; },
+      fps: 30, // Tripled the frame scanning rate
+      useBarCodeDetectorIfSupported: true, // Enables native hardware acceleration
+      qrbox: function(vw, vh) { return { width: Math.min(vw * 0.9, 350), height: 150 }; }, // Widened box for easier barcode capture
       formatsToSupport: [ 
         Html5QrcodeSupportedFormats.QR_CODE, 
         Html5QrcodeSupportedFormats.CODE_128, 
