@@ -13,9 +13,14 @@
     #reader, #nativeWrap { flex: 1; width: 100%; display: flex; align-items: center; justify-content: center; position: relative; overflow: hidden; }
     #reader video, #nativeVideo { object-fit: cover; width: 100%; height: 100%; }
     #nativeWrap { display: none; }
+    #box {
+      position: absolute; border: 2px solid rgba(0,168,232,0.9);
+      box-shadow: 0 0 0 2000px rgba(0,0,0,0.35);
+      pointer-events: none;
+    }
     #hint {
       position: absolute; bottom: 20px; left: 0; right: 0;
-      text-align: center; font-size: 13px; color: rgba(255,255,255,0.75);
+      text-align: center; font-size: 13px; color: rgba(255,255,255,0.85);
       pointer-events: none; transition: opacity 0.3s; opacity: 0;
     }
     #hint.show { opacity: 1; }
@@ -30,7 +35,8 @@
   <!-- Fast path: raw video + native BarcodeDetector -->
   <div id="nativeWrap">
     <video id="nativeVideo" autoplay playsinline muted></video>
-    <div id="hint">Tilt the phone slightly to avoid screen glare</div>
+    <div id="box"></div>
+    <div id="hint">Move closer for small codes</div>
   </div>
   <!-- Fallback path: html5-qrcode (iOS / unsupported browsers) -->
   <div id="reader"></div>
@@ -49,24 +55,25 @@
       }
     }
 
-    // ---------- FAST PATH: native BarcodeDetector, no canvas, no library ----------
+    // ---------- FAST PATH: native BarcodeDetector, cropped+zoomed ROI ----------
     async function startNative() {
       const formats = await BarcodeDetector.getSupportedFormats();
       const wanted = ['qr_code','code_128','code_39','ean_13','upc_a'].filter(f => formats.includes(f));
       const detector = new BarcodeDetector({ formats: wanted.length ? wanted : formats });
 
       const video = document.getElementById('nativeVideo');
+      const boxEl = document.getElementById('box');
       const hint = document.getElementById('hint');
       document.getElementById('nativeWrap').style.display = 'flex';
       document.getElementById('reader').style.display = 'none';
 
+      // Higher source resolution: more raw pixels to zoom into for small codes.
+      // Cost is fine because we only ever crop+process a small region of it.
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: { ideal: "environment" },
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-          // torch explicitly left off; continuous focus/exposure handle
-          // both close-up phone-screen scans and typical printed codes
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
           advanced: [
             { focusMode: "continuous" },
             { exposureMode: "continuous" },
@@ -75,66 +82,102 @@
         }
       });
       video.srcObject = stream;
-      // make sure torch is off if the device happens to default it on
+
+      const track = stream.getVideoTracks()[0];
       try {
-        const track = stream.getVideoTracks()[0];
         const caps = track.getCapabilities ? track.getCapabilities() : {};
-        if (caps.torch) await track.applyConstraints({ advanced: [{ torch: false }] });
-      } catch (e) { /* not all devices support this, ignore */ }
+        const constraintsToApply = [];
+        if (caps.torch) constraintsToApply.push({ torch: false });
+        // Use real hardware zoom if the device supports it — better than digital crop
+        if (caps.zoom && caps.zoom.max > caps.zoom.min) {
+          const midZoom = caps.zoom.min + (caps.zoom.max - caps.zoom.min) * 0.3;
+          constraintsToApply.push({ zoom: midZoom });
+        }
+        if (constraintsToApply.length) await track.applyConstraints({ advanced: constraintsToApply });
+      } catch (e) { /* not all devices expose these, ignore */ }
 
       await video.play();
 
-      // Offscreen canvas used only for the glare-compensated retry pass
-      const cw = 640, ch = 480;
+      // Draw the on-screen scan box guide (visual only)
+      function positionBox() {
+        const w = window.innerWidth, h = window.innerHeight - 60;
+        const size = Math.min(w, h) * 0.6;
+        boxEl.style.left = ((w - size) / 2) + 'px';
+        boxEl.style.top = (60 + (h - size) / 2) + 'px';
+        boxEl.style.width = size + 'px';
+        boxEl.style.height = size + 'px';
+      }
+      positionBox();
+      window.addEventListener('resize', positionBox);
+
+      // Offscreen canvas: crop to center ROI, upscale it — this is the
+      // "digital zoom" that makes small codes resolvable, and it's cheap
+      // because the canvas itself stays small regardless of source res.
+      const outSize = 700; // upscaled detection canvas size
       const canvas = document.createElement('canvas');
-      canvas.width = cw; canvas.height = ch;
+      canvas.width = outSize; canvas.height = outSize;
       const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
-      function detectEnhanced() {
-        ctx.drawImage(video, 0, 0, cw, ch);
-        const frame = ctx.getImageData(0, 0, cw, ch);
-        const data = frame.data;
+      function cropRegion(zoomFactor) {
+        const vw = video.videoWidth, vh = video.videoHeight;
+        if (!vw || !vh) return null;
+        const cropSize = Math.min(vw, vh) / zoomFactor;
+        const sx = (vw - cropSize) / 2;
+        const sy = (vh - cropSize) / 2;
+        return { sx, sy, cropSize };
+      }
 
-        // Recover contrast lost to glare: grayscale + histogram stretch,
-        // which pulls blown-out highlights and crushed shadows back apart
-        let min = 255, max = 0;
-        const gray = new Uint8ClampedArray(cw * ch);
-        for (let i = 0, p = 0; i < data.length; i += 4, p++) {
-          const g = (data[i] * 0.299 + data[i+1] * 0.587 + data[i+2] * 0.114);
-          gray[p] = g;
-          if (g < min) min = g;
-          if (g > max) max = g;
+      function detectCropped(zoomFactor, enhance) {
+        const region = cropRegion(zoomFactor);
+        if (!region) return Promise.resolve([]);
+        ctx.drawImage(video, region.sx, region.sy, region.cropSize, region.cropSize, 0, 0, outSize, outSize);
+
+        if (enhance) {
+          const frame = ctx.getImageData(0, 0, outSize, outSize);
+          const data = frame.data;
+          let min = 255, max = 0;
+          const gray = new Uint8ClampedArray(outSize * outSize);
+          for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+            const g = (data[i] * 0.299 + data[i+1] * 0.587 + data[i+2] * 0.114);
+            gray[p] = g;
+            if (g < min) min = g;
+            if (g > max) max = g;
+          }
+          const range = Math.max(max - min, 1);
+          for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+            const stretched = ((gray[p] - min) / range) * 255;
+            data[i] = data[i+1] = data[i+2] = stretched;
+          }
+          ctx.putImageData(frame, 0, 0);
         }
-        const range = Math.max(max - min, 1);
-        for (let i = 0, p = 0; i < data.length; i += 4, p++) {
-          const stretched = ((gray[p] - min) / range) * 255;
-          data[i] = data[i+1] = data[i+2] = stretched;
-        }
-        ctx.putImageData(frame, 0, 0);
         return detector.detect(canvas);
       }
 
       let scanning = true;
       let failStreak = 0;
       let hintShown = false;
+      // Alternate zoom levels each pass: 1.4x catches normal-size codes with
+      // margin, 2.4x catches small/far codes. Cheap to alternate since both
+      // detects run on the same small fixed-size canvas.
+      const zoomLevels = [1.4, 2.4];
+      let zi = 0;
 
       async function loop() {
         if (!scanning || done) return;
 
         try {
-          // Primary: raw frame, cheapest and fastest, handles the normal case
-          const codes = await detector.detect(video);
+          const codes = await detectCropped(zoomLevels[zi], false);
           if (codes.length > 0) return finish(codes[0].rawValue);
           failStreak++;
         } catch (e) {
           failStreak++;
         }
+        zi = (zi + 1) % zoomLevels.length;
 
-        // Secondary: only after repeated raw failures, likely glare/low contrast
-        if (failStreak > 8) {
+        if (failStreak > 10) {
           if (!hintShown) { hint.classList.add('show'); hintShown = true; }
           try {
-            const codes2 = await detectEnhanced();
+            const codes2 = await detectCropped(2.4, true); // enhanced + tightest zoom
             if (codes2.length > 0) return finish(codes2[0].rawValue);
           } catch (e) { /* ignore, keep looping */ }
         } else if (hintShown) {
@@ -164,13 +207,13 @@
         fps: 20,
         disableFlip: true,
         qrbox: function(vw, vh) {
-          const size = Math.min(vw, vh) * 0.7;
-          return { width: Math.max(size, 250), height: Math.max(size * 0.5, 150) };
+          const size = Math.min(vw, vh) * 0.6;
+          return { width: size, height: size };
         },
         videoConstraints: {
           facingMode: "environment",
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
           advanced: [
             { focusMode: "continuous" },
             { exposureMode: "continuous" },
