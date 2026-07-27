@@ -15,57 +15,67 @@
   </style>
 </head>
 <body>
-
   <div class="header">
     <span>Scanner Active</span>
     <button class="close-btn" onclick="window.close()">Cancel</button>
   </div>
   <div id="reader"></div>
-
   <script>
     const html5QrCode = new Html5Qrcode("reader");
-    
-    const config = { 
-      fps: 60, 
-      useBarCodeDetectorIfSupported: true, 
-      qrbox: function(vw, vh) { return { width: Math.min(vw * 0.9, 400), height: 150 }; },
+    let scanned = false;
+
+    const config = {
+      fps: 20,
+      disableFlip: true,
+      qrbox: function(vw, vh) {
+        const size = Math.min(vw, vh) * 0.7;
+        return { width: Math.max(size, 250), height: Math.max(size * 0.5, 150) };
+      },
       videoConstraints: {
         facingMode: "environment",
-        width: { min: 1280, ideal: 1920, max: 3840 },
-        height: { min: 720, ideal: 1080, max: 2160 },
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
         advanced: [{ focusMode: "continuous" }]
       },
-      formatsToSupport: [ 
-        Html5QrcodeSupportedFormats.QR_CODE, 
-        Html5QrcodeSupportedFormats.CODE_128, 
-        Html5QrcodeSupportedFormats.CODE_39, 
-        Html5QrcodeSupportedFormats.EAN_13, 
+      formatsToSupport: [
+        Html5QrcodeSupportedFormats.QR_CODE,
+        Html5QrcodeSupportedFormats.CODE_128,
+        Html5QrcodeSupportedFormats.CODE_39,
+        Html5QrcodeSupportedFormats.EAN_13,
         Html5QrcodeSupportedFormats.UPC_A
-      ]
+      ],
+      // THE FIX: this MUST be nested inside experimentalFeatures, not top-level.
+      // It lets the browser's native, hardware-accelerated BarcodeDetector do the
+      // decoding instead of the much slower pure-JS fallback.
+      experimentalFeatures: {
+        useBarCodeDetectorIfSupported: true
+      }
     };
 
-    html5QrCode.start({ facingMode: "environment" }, config,
-      (decodedText) => {
-        html5QrCode.stop().then(() => {
-          if (window.opener) {
-            window.opener.postMessage({ code: decodedText.trim() }, '*');
-            window.close();
-          } else {
-            alert("Scanned: " + decodedText + "\n\nPlease close this tab manually.");
-          }
-        });
-      },
-      (errorMessage) => {}
-    ).catch(err => {
-      html5QrCode.start({ facingMode: "user" }, config, (text) => {
-        html5QrCode.stop().then(() => {
-          if (window.opener) {
-            window.opener.postMessage({ code: text.trim() }, '*');
-            window.close();
-          }
-        });
-      }).catch(err2 => alert("Camera Access Denied. Please allow camera permissions."));
-    });
+    function onScanSuccess(decodedText) {
+      if (scanned) return; // guard against duplicate fires before stop() resolves
+      scanned = true;
+      html5QrCode.stop().then(() => {
+        if (window.opener) {
+          window.opener.postMessage({ code: decodedText.trim() }, '*');
+          window.close();
+        } else {
+          alert("Scanned: " + decodedText + "\n\nPlease close this tab manually.");
+        }
+      }).catch(() => {
+        // even if stop() errors, still deliver the result
+        if (window.opener) {
+          window.opener.postMessage({ code: decodedText.trim() }, '*');
+          window.close();
+        }
+      });
+    }
+
+    html5QrCode.start({ facingMode: "environment" }, config, onScanSuccess, () => {})
+      .catch(() => {
+        html5QrCode.start({ facingMode: "user" }, config, onScanSuccess, () => {})
+          .catch(() => alert("Camera Access Denied. Please allow camera permissions."));
+      });
   </script>
 </body>
 </html>
