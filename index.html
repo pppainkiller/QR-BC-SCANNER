@@ -10,8 +10,15 @@
     body { margin: 0; background: #000; color: white; font-family: 'Segoe UI', Arial, sans-serif; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
     .header { padding: 15px; text-align: center; background: #002b49; font-size: 18px; font-weight: bold; border-bottom: 2px solid #00a8e8; display: flex; justify-content: space-between; align-items: center;}
     .close-btn { background: #c8102e; color: white; border: none; padding: 8px 15px; font-weight: bold; cursor: pointer; }
-    #reader { flex: 1; width: 100%; display: flex; align-items: center; justify-content: center; }
-    #reader video { object-fit: cover; width: 100%; height: 100%; }
+    #reader, #nativeWrap { flex: 1; width: 100%; display: flex; align-items: center; justify-content: center; position: relative; overflow: hidden; }
+    #reader video, #nativeVideo { object-fit: cover; width: 100%; height: 100%; }
+    #nativeWrap { display: none; }
+    #hint {
+      position: absolute; bottom: 20px; left: 0; right: 0;
+      text-align: center; font-size: 13px; color: rgba(255,255,255,0.75);
+      pointer-events: none; transition: opacity 0.3s; opacity: 0;
+    }
+    #hint.show { opacity: 1; }
   </style>
 </head>
 <body>
@@ -19,63 +26,181 @@
     <span>Scanner Active</span>
     <button class="close-btn" onclick="window.close()">Cancel</button>
   </div>
+
+  <!-- Fast path: raw video + native BarcodeDetector -->
+  <div id="nativeWrap">
+    <video id="nativeVideo" autoplay playsinline muted></video>
+    <div id="hint">Tilt the phone slightly to avoid screen glare</div>
+  </div>
+  <!-- Fallback path: html5-qrcode (iOS / unsupported browsers) -->
   <div id="reader"></div>
+
   <script>
-    const html5QrCode = new Html5Qrcode("reader");
-    let scanned = false;
+    let done = false;
 
-    const config = {
-      fps: 20,
-      disableFlip: true,
-      qrbox: function(vw, vh) {
-        const size = Math.min(vw, vh) * 0.7;
-        return { width: Math.max(size, 250), height: Math.max(size * 0.5, 150) };
-      },
-      videoConstraints: {
-        facingMode: "environment",
-        width: { ideal: 1280 },
-        height: { ideal: 720 },
-        advanced: [{ focusMode: "continuous" }]
-      },
-      formatsToSupport: [
-        Html5QrcodeSupportedFormats.QR_CODE,
-        Html5QrcodeSupportedFormats.CODE_128,
-        Html5QrcodeSupportedFormats.CODE_39,
-        Html5QrcodeSupportedFormats.EAN_13,
-        Html5QrcodeSupportedFormats.UPC_A
-      ],
-      // THE FIX: this MUST be nested inside experimentalFeatures, not top-level.
-      // It lets the browser's native, hardware-accelerated BarcodeDetector do the
-      // decoding instead of the much slower pure-JS fallback.
-      experimentalFeatures: {
-        useBarCodeDetectorIfSupported: true
+    function deliver(text) {
+      if (done) return;
+      done = true;
+      if (window.opener) {
+        window.opener.postMessage({ code: text.trim() }, '*');
+        window.close();
+      } else {
+        alert("Scanned: " + text + "\n\nPlease close this tab manually.");
       }
-    };
-
-    function onScanSuccess(decodedText) {
-      if (scanned) return; // guard against duplicate fires before stop() resolves
-      scanned = true;
-      html5QrCode.stop().then(() => {
-        if (window.opener) {
-          window.opener.postMessage({ code: decodedText.trim() }, '*');
-          window.close();
-        } else {
-          alert("Scanned: " + decodedText + "\n\nPlease close this tab manually.");
-        }
-      }).catch(() => {
-        // even if stop() errors, still deliver the result
-        if (window.opener) {
-          window.opener.postMessage({ code: decodedText.trim() }, '*');
-          window.close();
-        }
-      });
     }
 
-    html5QrCode.start({ facingMode: "environment" }, config, onScanSuccess, () => {})
-      .catch(() => {
-        html5QrCode.start({ facingMode: "user" }, config, onScanSuccess, () => {})
-          .catch(() => alert("Camera Access Denied. Please allow camera permissions."));
+    // ---------- FAST PATH: native BarcodeDetector, no canvas, no library ----------
+    async function startNative() {
+      const formats = await BarcodeDetector.getSupportedFormats();
+      const wanted = ['qr_code','code_128','code_39','ean_13','upc_a'].filter(f => formats.includes(f));
+      const detector = new BarcodeDetector({ formats: wanted.length ? wanted : formats });
+
+      const video = document.getElementById('nativeVideo');
+      const hint = document.getElementById('hint');
+      document.getElementById('nativeWrap').style.display = 'flex';
+      document.getElementById('reader').style.display = 'none';
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          // torch explicitly left off; continuous focus/exposure handle
+          // both close-up phone-screen scans and typical printed codes
+          advanced: [
+            { focusMode: "continuous" },
+            { exposureMode: "continuous" },
+            { whiteBalanceMode: "continuous" }
+          ]
+        }
       });
+      video.srcObject = stream;
+      // make sure torch is off if the device happens to default it on
+      try {
+        const track = stream.getVideoTracks()[0];
+        const caps = track.getCapabilities ? track.getCapabilities() : {};
+        if (caps.torch) await track.applyConstraints({ advanced: [{ torch: false }] });
+      } catch (e) { /* not all devices support this, ignore */ }
+
+      await video.play();
+
+      // Offscreen canvas used only for the glare-compensated retry pass
+      const cw = 640, ch = 480;
+      const canvas = document.createElement('canvas');
+      canvas.width = cw; canvas.height = ch;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+      function detectEnhanced() {
+        ctx.drawImage(video, 0, 0, cw, ch);
+        const frame = ctx.getImageData(0, 0, cw, ch);
+        const data = frame.data;
+
+        // Recover contrast lost to glare: grayscale + histogram stretch,
+        // which pulls blown-out highlights and crushed shadows back apart
+        let min = 255, max = 0;
+        const gray = new Uint8ClampedArray(cw * ch);
+        for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+          const g = (data[i] * 0.299 + data[i+1] * 0.587 + data[i+2] * 0.114);
+          gray[p] = g;
+          if (g < min) min = g;
+          if (g > max) max = g;
+        }
+        const range = Math.max(max - min, 1);
+        for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+          const stretched = ((gray[p] - min) / range) * 255;
+          data[i] = data[i+1] = data[i+2] = stretched;
+        }
+        ctx.putImageData(frame, 0, 0);
+        return detector.detect(canvas);
+      }
+
+      let scanning = true;
+      let failStreak = 0;
+      let hintShown = false;
+
+      async function loop() {
+        if (!scanning || done) return;
+
+        try {
+          // Primary: raw frame, cheapest and fastest, handles the normal case
+          const codes = await detector.detect(video);
+          if (codes.length > 0) return finish(codes[0].rawValue);
+          failStreak++;
+        } catch (e) {
+          failStreak++;
+        }
+
+        // Secondary: only after repeated raw failures, likely glare/low contrast
+        if (failStreak > 8) {
+          if (!hintShown) { hint.classList.add('show'); hintShown = true; }
+          try {
+            const codes2 = await detectEnhanced();
+            if (codes2.length > 0) return finish(codes2[0].rawValue);
+          } catch (e) { /* ignore, keep looping */ }
+        } else if (hintShown) {
+          hint.classList.remove('show');
+          hintShown = false;
+        }
+
+        requestAnimationFrame(loop);
+      }
+
+      function finish(text) {
+        scanning = false;
+        stream.getTracks().forEach(t => t.stop());
+        deliver(text);
+      }
+
+      requestAnimationFrame(loop);
+    }
+
+    // ---------- FALLBACK PATH: html5-qrcode (used only if BarcodeDetector missing) ----------
+    function startFallback() {
+      document.getElementById('nativeWrap').style.display = 'none';
+      document.getElementById('reader').style.display = 'flex';
+
+      const html5QrCode = new Html5Qrcode("reader");
+      const config = {
+        fps: 20,
+        disableFlip: true,
+        qrbox: function(vw, vh) {
+          const size = Math.min(vw, vh) * 0.7;
+          return { width: Math.max(size, 250), height: Math.max(size * 0.5, 150) };
+        },
+        videoConstraints: {
+          facingMode: "environment",
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          advanced: [
+            { focusMode: "continuous" },
+            { exposureMode: "continuous" },
+            { whiteBalanceMode: "continuous" }
+          ]
+        },
+        formatsToSupport: [
+          Html5QrcodeSupportedFormats.QR_CODE,
+          Html5QrcodeSupportedFormats.CODE_128,
+          Html5QrcodeSupportedFormats.CODE_39,
+          Html5QrcodeSupportedFormats.EAN_13,
+          Html5QrcodeSupportedFormats.UPC_A
+        ]
+      };
+      const onSuccess = (text) => {
+        html5QrCode.stop().catch(() => {}).finally(() => deliver(text));
+      };
+      html5QrCode.start({ facingMode: "environment" }, config, onSuccess, () => {})
+        .catch(() => {
+          html5QrCode.start({ facingMode: "user" }, config, onSuccess, () => {})
+            .catch(() => alert("Camera Access Denied. Please allow camera permissions."));
+        });
+    }
+
+    // ---------- ENTRY POINT ----------
+    if ('BarcodeDetector' in window) {
+      startNative().catch(() => startFallback());
+    } else {
+      startFallback();
+    }
   </script>
 </body>
 </html>
